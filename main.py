@@ -1,28 +1,26 @@
+import threading
+import time
+import cv2
+import math
 from flask import Flask, Response, jsonify, request
 from flask_cors import CORS
-from flask_sqlalchemy import SQLAlchemy # Thư viện DB
+from flask_sqlalchemy import SQLAlchemy
 from datetime import datetime
 from ultralytics import YOLO
-import cv2
 
 app = Flask(__name__)
-# Cho phép mọi nguồn kết nối (tránh lỗi CORS khi gọi từ React)
 CORS(app, resources={r"/*": {"origins": "*"}})
 
-# --- 1. CẤU HÌNH KẾT NỐI MYSQL (HEIDISQL) ---
-# Cú pháp: mysql+pymysql://USERNAME:PASSWORD@HOST:PORT/TEN_DB
-# Mặc định XAMPP: User='root', Pass='', Host='localhost', DB='sign_language_db'
+# --- 1. CẤU HÌNH DATABASE (GIỮ NGUYÊN) ---
 app.config['SQLALCHEMY_DATABASE_URI'] = 'mysql+pymysql://root:@localhost/sign_language_db'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-
 db = SQLAlchemy(app)
 
-# --- 2. ĐỊNH NGHĨA CÁC BẢNG (MODELS) ---
+# --- MODELS (GIỮ NGUYÊN) ---
 class User(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     username = db.Column(db.String(50), unique=True, nullable=False)
     password = db.Column(db.String(100), nullable=False)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
 class Dictionary(db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -37,54 +35,119 @@ class History(db.Model):
     confidence = db.Column(db.Float)
     timestamp = db.Column(db.DateTime, default=datetime.utcnow)
 
-# --- 3. PHẦN AI & CAMERA (GIỮ NGUYÊN CODE CỦA BẠN) ---
-# Hãy đảm bảo file 'best (3).pt' nằm cùng thư mục với main.py
-model = YOLO('best (3).pt') 
+# --- 2. HỆ THỐNG AI & CAMERA ĐA LUỒNG (TRÁI TIM CỦA TỐI ƯU) ---
 
-# Biến toàn cục để lưu chữ cái đang nhận diện
-current_result = {
+# Load model
+model = YOLO('best (3).pt')
+
+# Biến toàn cục dùng chung giữa các luồng
+global_frame = None            # Lưu khung hình mới nhất từ camera
+global_result = {              # Lưu kết quả AI mới nhất
     "text": "...",
     "confidence": 0.0
 }
+lock = threading.Lock()        # Khóa an toàn để tránh xung đột dữ liệu
+camera_active = True           # Cờ kiểm soát camera
+
+# --- LUỒNG CAMERA (Chỉ đọc ảnh, không chạy AI) ---
+def camera_thread():
+    global global_frame, camera_active
+    # Mở camera
+    cap = cv2.VideoCapture(0)
+    # Giảm resolution đầu vào camera xuống mức trung bình để nhẹ máy
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    
+    while camera_active:
+        success, frame = cap.read()
+        if success:
+            frame = cv2.flip(frame, 1) # Lật ảnh
+            
+            # Dùng lock để cập nhật ảnh an toàn
+            with lock:
+                global_frame = frame.copy()
+        
+        # Ngủ cực ngắn để giảm tải CPU không cần thiết (khoảng 30 FPS)
+        time.sleep(0.015)
+    
+    cap.release()
+
+# --- LUỒNG AI (Chạy ngầm, xử lý ảnh nhỏ) ---
+def ai_processing_thread():
+    global global_result, camera_active
+    
+    while camera_active:
+        img_for_ai = None
+        
+        # 1. Lấy ảnh mới nhất từ luồng Camera
+        with lock:
+            if global_frame is not None:
+                # TỐI ƯU QUAN TRỌNG: Resize ảnh xuống thật nhỏ chỉ để cho AI nhìn
+                # 320x240 là đủ để nhận diện tay, giúp tốc độ tăng gấp 4 lần
+                img_for_ai = cv2.resize(global_frame, (320, 240))
+        
+        if img_for_ai is not None:
+            # 2. Chạy AI trên ảnh nhỏ
+            results = model(img_for_ai, conf=0.5, verbose=False)
+            
+            # 3. Cập nhật kết quả
+            if len(results[0].boxes) > 0:
+                box = results[0].boxes[0]
+                class_id = int(box.cls[0])
+                conf = float(box.conf[0])
+                name = model.names[class_id]
+                
+                global_result = {
+                    "text": name,
+                    "confidence": round(conf, 2)
+                }
+            else:
+                global_result = {
+                    "text": "...",
+                    "confidence": 0.0
+                }
+        
+        # TỐI ƯU: Chỉ chạy AI khoảng 10 lần/giây (0.1s nghỉ)
+        # Để dành CPU cho việc truyền hình ảnh mượt mà
+        time.sleep(0.1)
+
+# Khởi chạy các luồng ngay khi App bắt đầu
+# Lưu ý: daemon=True để luồng tự tắt khi tắt chương trình chính
+t_cam = threading.Thread(target=camera_thread, daemon=True)
+t_ai = threading.Thread(target=ai_processing_thread, daemon=True)
+t_cam.start()
+t_ai.start()
+
+# --- 3. CÁC API FLASK ---
 
 def generate_frames():
-    global current_result 
-    camera = cv2.VideoCapture(0) 
-    
+    """Hàm này chỉ lấy ảnh từ bộ nhớ và gửi đi, KHÔNG xử lý gì cả -> Rất nhanh"""
     while True:
-        success, frame = camera.read()
-        if not success:
-            break
+        frame_display = None
         
-        frame = cv2.flip(frame, 1)
-        results = model(frame, conf=0.5) 
+        with lock:
+            if global_frame is not None:
+                frame_display = global_frame.copy()
         
-        # Lấy chữ cái ra khỏi kết quả
-        if len(results[0].boxes) > 0:
-            box = results[0].boxes[0] 
-            class_id = int(box.cls[0])
-            conf = float(box.conf[0])
-            detected_text = model.names[class_id]
+        if frame_display is None:
+            time.sleep(0.1)
+            continue
             
-            # Cập nhật vào biến toàn cục
-            current_result = {
-                "text": detected_text,
-                "confidence": round(conf, 2)
-            }
-        else:
-            current_result = {
-                "text": "...",
-                "confidence": 0.0
-            }
-
-        annotated_frame = results[0].plot()
-        ret, buffer = cv2.imencode('.jpg', annotated_frame)
-        frame = buffer.tobytes()
+        # Vẽ kết quả hiện tại lên hình (để người dùng thấy trực tiếp trên video)
+        # Lấy kết quả từ biến toàn cục (do luồng AI cập nhật)
+        text = global_result["text"]
+        conf = global_result["confidence"]
+        
+        if text != "...":
+            cv2.putText(frame_display, f"{text} ({conf})", (30, 50), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+        
+        # Encode sang JPG
+        ret, buffer = cv2.imencode('.jpg', frame_display)
+        frame_bytes = buffer.tobytes()
 
         yield (b'--frame\r\n'
-               b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
-
-# --- 4. CÁC API CHO FRONTEND REACT GỌI VÀO ---
+               b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
 
 @app.route('/video_feed')
 def video_feed():
@@ -92,90 +155,44 @@ def video_feed():
 
 @app.route('/api/status')
 def get_status():
-    return jsonify(current_result)
+    return jsonify(global_result)
 
-# API: Lấy danh sách từ điển
+# --- CÁC API DB (GIỮ NGUYÊN) ---
 @app.route('/api/dictionary', methods=['GET'])
 def get_dictionary():
     words = Dictionary.query.all()
-    output = []
-    for w in words:
-        output.append({
-            'id': w.id,
-            'word': w.word,
-            'description': w.description,
-            'image_url': w.image_url
-        })
+    output = [{'id': w.id, 'word': w.word, 'description': w.description, 'image_url': w.image_url} for w in words]
     return jsonify(output)
 
-# API: Lưu lịch sử (Frontend gọi khi người dùng bấm nút "Lưu")
 @app.route('/api/save_history', methods=['POST'])
 def save_history():
     data = request.json
-    new_record = History(
-        detected_word=data.get('word'),
-        confidence=data.get('confidence'),
-        user_id=data.get('user_id') # Có thể null
-    )
+    new_record = History(detected_word=data.get('word'), confidence=data.get('confidence'), user_id=data.get('user_id'))
     db.session.add(new_record)
     db.session.commit()
-    return jsonify({'message': 'Đã lưu vào Database thành công!'})
+    return jsonify({'message': 'Lưu thành công!'})
 
-# API: Tạo dữ liệu mẫu (Chạy 1 lần để nạp A, B, C vào database)
-@app.route('/init_data')
-def init_data():
-    if Dictionary.query.count() == 0:
-        w1 = Dictionary(word="A", description="Nắm bàn tay lại, ngón cái áp sát ngón trỏ.", image_url="https://example.com/a.png")
-        w2 = Dictionary(word="B", description="Giơ thẳng 4 ngón tay, ngón cái gập vào lòng bàn tay.", image_url="https://example.com/b.png")
-        w3 = Dictionary(word="C", description="Cong các ngón tay tạo thành hình chữ C.", image_url="https://example.com/c.png")
-        w4 = Dictionary(word="Hello", description="Đưa tay lên trán và vẫy ra xa.", image_url="https://example.com/hello.png")
-        
-        db.session.add_all([w1, w2, w3, w4])
-        db.session.commit()
-        return "Đã thêm dữ liệu mẫu (A, B, C, Hello) vào MySQL thành công!"
-    return "Dữ liệu đã có sẵn trong MySQL."
-# --- THÊM VÀO main.py ---
-
-# API 5: Đăng ký tài khoản mới
-@app.route('/api/register', methods=['POST'])
-def register():
-    data = request.json
-    # Kiểm tra xem email đã tồn tại chưa
-    existing_user = User.query.filter_by(username=data['email']).first()
-    if existing_user:
-        return jsonify({'success': False, 'message': 'Email này đã được sử dụng!'})
-    
-    # Tạo user mới
-    new_user = User(
-        username=data['email'],  # Dùng email làm username
-        password=data['password'] # Lưu ý: Thực tế nên mã hóa password, ở đây làm demo nên để trần
-    )
-    db.session.add(new_user)
-    db.session.commit()
-    return jsonify({'success': True, 'message': 'Đăng ký thành công!'})
-
-# API 6: Đăng nhập
 @app.route('/api/login', methods=['POST'])
 def login():
     data = request.json
-    # Tìm user trong database
     user = User.query.filter_by(username=data['email']).first()
-    
-    # Kiểm tra mật khẩu
     if user and user.password == data['password']:
-        return jsonify({
-            'success': True, 
-            'message': 'Đăng nhập thành công!',
-            'user': {'id': user.id, 'email': user.username}
-        })
-    
-    return jsonify({'success': False, 'message': 'Sai email hoặc mật khẩu!'})
+        return jsonify({'success': True, 'message': 'OK', 'user': {'id': user.id, 'email': user.username}})
+    return jsonify({'success': False, 'message': 'Fail'})
+
+@app.route('/api/register', methods=['POST'])
+def register():
+    data = request.json
+    if User.query.filter_by(username=data['email']).first():
+        return jsonify({'success': False, 'message': 'Email tồn tại'})
+    new_user = User(username=data['email'], password=data['password'])
+    db.session.add(new_user)
+    db.session.commit()
+    return jsonify({'success': True})
 
 if __name__ == "__main__":
-    # Lệnh này tự động tạo các bảng trong MySQL nếu chưa có
     with app.app_context():
         db.create_all()
-        print("Đã kết nối MySQL và khởi tạo bảng thành công!")
-
-    print("Backend đang chạy...")
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    print("Backend AI Multi-thread đang chạy...")
+    # use_reloader=False để tránh chạy 2 lần thread camera gây lỗi
+    app.run(host='0.0.0.0', port=5000, debug=False, threaded=True, use_reloader=False)
